@@ -9,6 +9,53 @@ import torch.utils.checkpoint as cp
 from collections import OrderedDict
 
 
+class _Attention(nn.Module):
+    def __init__(self, num_features, kernel_size=(3,3), stride=2, dropout=0.):
+        super(_Attention, self).__init__()
+        self.query_conv = nn.Conv2d(num_features, num_features/2, kernel_size, stride=stride, bias=True)
+        self.key_conv = nn.Conv2d(num_features, num_features/2, kernel_size, stride=stride, bias=True)
+        self.dropout = dropout
+    
+    # query: batch x channel x height x width
+    # candidates: depth x batch x channel x height x width
+    def forward(self, query, candidates):
+        # query: batch x dimmension
+        # keys : depth x batch x dimension
+        assert query.size(0) == candidates.size(1)
+        depth, batch_size, channel, height, width = candidates.size()
+        query = self.query_conv(query)
+        query = query.view(batch_size, 1, -1)
+        keys = candidates.view(-1, query.size(1), query.size(2), query.size(3))
+        keys = self.key_conv(condidates)
+        keys = keys.view(depth, batch_size, -1)
+        # keys: batch x depth x dimension
+        keys = keys.transpose(0, 1)
+        # keys: batch x dimension x depth
+        keys = keys.transpose(1, 2)
+
+        # attention_weight: batch x 1 x depth
+        attention_weight = torch.bmm(query, keys)
+        attention_weight = F.softmax(attention_weight, dim=-1)
+        attention_weight = F.dropout(attention_weight, p=self.dropout, training=self.training)
+
+        # candidates: batch x depth x other
+        cadidates = candidates.view(depth, batch_size, -1).transpose(0, 1)
+        value = torch.bmm(attention_weight, candidates)
+        value = value.view(batch_size, channel, height, width)
+
+        return value
+        
+def _atten_function_factory(norm, relu, conv, attention):
+    def bn_function(*inputs):
+        #concated_features = torch.cat(inputs, 1)
+        query = inputs[-1]
+        candidates = torch.stack(inputs)
+        atten_features = attention(query, candidates)
+        bottleneck_output = conv(relu(norm(atten_features)))
+        return bottleneck_output
+
+    return bn_function
+
 def _bn_function_factory(norm, relu, conv):
     def bn_function(*inputs):
         concated_features = torch.cat(inputs, 1)
@@ -21,6 +68,7 @@ def _bn_function_factory(norm, relu, conv):
 class _DenseLayer(nn.Module):
     def __init__(self, num_input_features, growth_rate, bn_size, drop_rate, efficient=False):
         super(_DenseLayer, self).__init__()
+        self.add_module('depth_attenion', _Attention(num_input_features)),
         self.add_module('norm1', nn.BatchNorm2d(num_input_features)),
         self.add_module('relu1', nn.ReLU(inplace=True)),
         self.add_module('conv1', nn.Conv2d(num_input_features, bn_size *
@@ -33,7 +81,7 @@ class _DenseLayer(nn.Module):
         self.efficient = efficient
 
     def forward(self, *prev_features):
-        bn_function = _bn_function_factory(self.norm1, self.relu1, self.conv1)
+        bn_function = _bn_function_factory(self.norm1, self.relu1, self.conv1, self.depth_attention)
         if self.efficient and any(prev_feature.requires_grad for prev_feature in prev_features):
             bottleneck_output = cp.checkpoint(bn_function, *prev_features)
         else:
